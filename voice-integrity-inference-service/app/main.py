@@ -7,16 +7,16 @@ app. Run with:
     uvicorn app.main:app --reload --port 8000
 
 Endpoints:
-  GET  /health           - liveness check + model info
-  POST /analyze          - upload an audio file, get back a per-window
-                            bonafide score timeline PLUS a speaker_match
-                            block (best enrolled speaker + similarity) -
-                            this is the one your React dashboard should
-                            call in place of its mocked scoring function
-  POST /enroll            - register one audio sample for a named speaker
-                            (ECAPA-TDNN embedding, averaged into that
-                            speaker's template if they're already enrolled)
-  GET  /speakers          - list currently enrolled speakers
+  GET  /health          - liveness check + model info
+  POST /analyze         - upload an audio file, get back a per-window
+                          bonafide score timeline PLUS a speaker_match
+                          block (best enrolled speaker + similarity) -
+                          this is the one your React dashboard should
+                          call in place of its mocked scoring function
+  POST /enroll          - register one audio sample for a named speaker
+                          (ECAPA-TDNN embedding, averaged into that
+                          speaker's template if they're already enrolled)
+  GET  /speakers        - list currently enrolled speakers
 
 The response shape below mirrors what a scenario-simulator dashboard
 typically expects (overall verdict + a timeline of window scores). Adjust
@@ -173,7 +173,14 @@ async def analyze(audio: UploadFile = File(...)):
         except ValueError as exc:
             raise HTTPException(status_code=500, detail=str(exc))
 
-        raw_scores.append(inference["bonafide_score"])
+        # --- UPDATED INVERSION LOGIC ---
+        # Probability is a decimal (0 to 1), so subtract from 1.0
+        corrected_prob = 1.0 - inference["bonafide_probability"]
+        # Score is a percentage (0 to 100), so subtract from 100.0
+        corrected_score = 100.0 - inference["bonafide_score"]
+
+        raw_scores.append(corrected_score)
+        
         # Trailing rolling average over the last SMOOTHING_WINDOW windows
         # (including this one). Only looks backward so it works the same
         # way in a future streaming/live setup as it does here on a full file.
@@ -185,8 +192,8 @@ async def analyze(audio: UploadFile = File(...)):
                 start_time=meta["start_time"],
                 end_time=meta["end_time"],
                 speech_ratio=meta["speech_ratio"],
-                bonafide_score=inference["bonafide_score"],
-                bonafide_probability=inference["bonafide_probability"],
+                bonafide_score=corrected_score,
+                bonafide_probability=corrected_prob,
                 smoothed_score=smoothed,
             )
         )
