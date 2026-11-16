@@ -1,3 +1,4 @@
+
 """
 Voice-integrity inference service.
 
@@ -8,20 +9,10 @@ app. Run with:
 
 Endpoints:
   GET  /health          - liveness check + model info
-  POST /analyze         - upload an audio file, get back a per-window
-                          bonafide score timeline PLUS a speaker_match
-                          block (best enrolled speaker + similarity) -
-                          this is the one your React dashboard should
-                          call in place of its mocked scoring function
-  POST /enroll          - register one audio sample for a named speaker
-                          (ECAPA-TDNN embedding, averaged into that
-                          speaker's template if they're already enrolled)
-  GET  /speakers        - list currently enrolled speakers
-
-The response shape below mirrors what a scenario-simulator dashboard
-typically expects (overall verdict + a timeline of window scores). Adjust
-field names to match whatever your dashboard's mock currently returns -
-that's the main thing that keeps this swap-in low-effort.
+  POST /analyze         - upload audio and get per-window bonafide scores
+                          plus speaker identification
+  POST /enroll          - register an audio sample for a named speaker
+  GET  /speakers         - list currently enrolled speakers
 """
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -32,8 +23,6 @@ from . import model, preprocessing, speaker_model
 
 app = FastAPI(title="Voice Integrity Inference Service")
 
-# Loosen this to your actual dashboard origin(s) before the demo - "*" is
-# fine for local hackathon testing but not for anything beyond that.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,11 +31,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# Number of recent windows averaged into smoothed_score. At a 0.5s hop this
-# is a 2.5s trailing window - short enough to react to a real change in
-# speaker, long enough to iron out single-window noise. Tune once you have
-# a feel for the fine-tuned model's score distribution.
 SMOOTHING_WINDOW = 5
 
 
@@ -82,10 +66,9 @@ class EnrollResponse(BaseModel):
 
 @app.on_event("startup")
 def startup():
-    # AASIST is already loaded at import time in model.py; this just
-    # confirms it and fails fast if the checkpoint is missing. ECAPA is
-    # deliberately NOT loaded here - see speaker_model.load_classifier()
-    # for why - so startup stays fast even before anyone enrolls/identifies.
+    # AASIST is loaded at import time in model.py.
+    # Confirm it and fail fast if the checkpoint is missing.
+    # ECAPA is loaded only when speaker identification is needed.
     model.load_model()
 
 
@@ -107,49 +90,84 @@ def speakers():
 @app.post("/enroll", response_model=EnrollResponse)
 async def enroll(name: str = Form(...), audio: UploadFile = File(...)):
     name = name.strip()
+
     if not name:
-        raise HTTPException(status_code=400, detail="Speaker name is required.")
+        raise HTTPException(
+            status_code=400,
+            detail="Speaker name is required."
+        )
 
     audio_bytes = await audio.read()
+
     if not audio_bytes:
-        raise HTTPException(status_code=400, detail="Empty upload.")
+        raise HTTPException(
+            status_code=400,
+            detail="Empty upload."
+        )
 
     try:
         waveform, original_sr = preprocessing.load_audio_bytes(audio_bytes)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not decode audio: {exc}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not decode audio: {exc}"
+        )
 
     result = speaker_model.enroll_speaker(name, waveform, original_sr)
+
     return EnrollResponse(**result)
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(audio: UploadFile = File(...)):
     audio_bytes = await audio.read()
-    if not audio_bytes:
-        raise HTTPException(status_code=400, detail="Empty upload.")
 
+    if not audio_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="Empty upload."
+        )
+
+    # Audio preprocessing
     try:
         result = preprocessing.preprocess_audio_bytes(audio_bytes)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Preprocessing failed: {exc}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Preprocessing failed: {exc}"
+        )
 
-    # Speaker identification runs once against the whole clip (ECAPA
-    # embeddings are meant for longer utterances, not 4s AASIST windows),
-    # not per-window like the spoof score. If nobody's enrolled yet, this
-    # comes back all-None and the frontend should treat that as "no
-    # identity check performed" rather than "no match".
-    try:
-        waveform, original_sr = preprocessing.load_audio_bytes(audio_bytes)
-        speaker_result = speaker_model.identify_speaker(waveform, original_sr)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Speaker identification failed: {exc}")
+    # Speaker identification:
+    # Only load/use ECAPA when at least one speaker is enrolled.
+    enrolled_speakers = speaker_model.list_enrolled_speakers()
 
-    speaker_match = SpeakerMatch(
-        best_speaker=speaker_result["best_speaker"],
-        best_similarity=speaker_result["best_similarity"],
-        match_score=speaker_result["match_score"],
-    )
+    if enrolled_speakers:
+        try:
+            waveform, original_sr = preprocessing.load_audio_bytes(audio_bytes)
+
+            speaker_result = speaker_model.identify_speaker(
+                waveform,
+                original_sr
+            )
+
+            speaker_match = SpeakerMatch(
+                best_speaker=speaker_result["best_speaker"],
+                best_similarity=speaker_result["best_similarity"],
+                match_score=speaker_result["match_score"],
+            )
+
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Speaker identification failed: {exc}"
+            )
+
+    else:
+        speaker_match = SpeakerMatch(
+            best_speaker=None,
+            best_similarity=None,
+            match_score=None,
+        )
 
     windows = result["windows"]
     metadata = result["metadata"]
@@ -167,23 +185,25 @@ async def analyze(audio: UploadFile = File(...)):
 
     raw_scores: list[float] = []
     window_scores: list[WindowScore] = []
+
     for window_tensor, meta in zip(windows, metadata):
         try:
             inference = model.aasist_inference(window_tensor.squeeze())
         except ValueError as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+            raise HTTPException(
+                status_code=500,
+                detail=str(exc)
+            )
 
-        # --- UPDATED INVERSION LOGIC ---
-        # Probability is a decimal (0 to 1), so subtract from 1.0
+        # Convert bonafide probability into spoof probability.
         corrected_prob = 1.0 - inference["bonafide_probability"]
-        # Score is a percentage (0 to 100), so subtract from 100.0
+
+        # Convert bonafide score into spoof score.
         corrected_score = 100.0 - inference["bonafide_score"]
 
         raw_scores.append(corrected_score)
-        
-        # Trailing rolling average over the last SMOOTHING_WINDOW windows
-        # (including this one). Only looks backward so it works the same
-        # way in a future streaming/live setup as it does here on a full file.
+
+        # Trailing rolling average over the last SMOOTHING_WINDOW windows.
         recent = raw_scores[-SMOOTHING_WINDOW:]
         smoothed = sum(recent) / len(recent)
 
